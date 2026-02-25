@@ -50,14 +50,22 @@ install_apply_patch()
 # ----------------------------
 # 1) Secrets + runtime config
 # ----------------------------
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+_IN_COLAB = False
+try:
+    from google.colab import userdata as _colab_userdata  # type: ignore
+    from google.colab import drive as _colab_drive  # type: ignore
+    _IN_COLAB = True
+except ImportError:
+    _colab_userdata = None  # type: ignore
+    _colab_drive = None  # type: ignore
 
 _LEGACY_CFG_WARNED: Set[str] = set()
 
 def _userdata_get(name: str) -> Optional[str]:
+    if not _IN_COLAB:
+        return None
     try:
-        return userdata.get(name)
+        return _colab_userdata.get(name)  # type: ignore[union-attr]
     except Exception:
         return None
 
@@ -150,15 +158,20 @@ if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
 
 # ----------------------------
-# 2) Mount Drive
+# 2) Mount Drive / path setup
 # ----------------------------
-if not pathlib.Path("/content/drive/MyDrive").exists():
-    drive.mount("/content/drive")
+if _IN_COLAB:
+    if not pathlib.Path("/content/drive/MyDrive").exists():
+        _colab_drive.mount("/content/drive")  # type: ignore[union-attr]
+    DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
+    REPO_DIR   = pathlib.Path("/content/ouroboros_repo").resolve()
+else:
+    # Non-Colab server: use local directories.
+    # Override with env vars OUROBOROS_DRIVE_ROOT / OUROBOROS_REPO_DIR if needed.
+    DRIVE_ROOT = pathlib.Path(os.environ.get("OUROBOROS_DRIVE_ROOT", "/opt/ouroboros/data")).resolve()
+    REPO_DIR   = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR",  str(pathlib.Path(__file__).parent))).resolve()
 
-DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
-
-for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
+for sub in ["state", "logs", "memory", "memory/knowledge", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)
 REPO_DIR.mkdir(parents=True, exist_ok=True)
 
