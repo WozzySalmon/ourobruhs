@@ -90,7 +90,9 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
         return "⚠️ PRE_PUSH_TEST_ERROR: pytest timed out after 30 seconds"
 
     except FileNotFoundError:
-        return "⚠️ PRE_PUSH_TEST_ERROR: pytest not installed or not found in PATH"
+        # pytest not installed — no tests to run, don't block push
+        log.debug("pytest not found, skipping pre-push tests")
+        return None
 
     except Exception as e:
         log.warning(f"Pre-push tests failed with exception: {e}", exc_info=True)

@@ -148,8 +148,15 @@ class OuroborosAgent:
                 capture_output=True, text=True, timeout=10, check=True
             )
             dirty_files = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if dirty_files:
+            # Separate tracked changes from untracked files
+            tracked_changes = [f for f in dirty_files if not f.startswith('??')]
+            if dirty_files and not tracked_changes:
+                # Only untracked files (e.g. data/ dir) — not a corruption, skip auto-rescue
+                log.debug(f'Startup: {len(dirty_files)} untracked files (not in .gitignore), ignoring')
+                return {'uncommitted_changes': {'status': 'ok', 'note': 'only_untracked'}}, 0
+            if tracked_changes:
                 # Auto-rescue: commit and push
+                dirty_files = tracked_changes
                 auto_committed = False
                 try:
                     # Only stage tracked files (not secrets/notebooks)

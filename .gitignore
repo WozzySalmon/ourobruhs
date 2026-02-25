@@ -27,3 +27,6 @@ Thumbs.db
 # Release artifacts (not tracked)
 .create_release.py
 .release_notes.md
+
+# Runtime data (logs, memory, state)
+data/
