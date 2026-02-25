@@ -168,6 +168,10 @@ def _ensure_browser(ctx: ToolContext):
     return ctx.browser_state.page
 
 
+from playwright.sync_api import sync_playwright
+from playwright.sync_api import PlaywrightContextManager
+
+
 def cleanup_browser(ctx: ToolContext) -> None:
     """Close browser and playwright. Called by agent.py in finally block.
 
