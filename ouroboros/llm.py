@@ -1,11 +1,13 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter or Google AI directly).
+The only module that communicates with the LLM API (OpenRouter or Google Vertex directly).
 Contract: chat(), default_model(), available_models(), add_usage().
 
-If GOOGLE_API_KEY is set, uses Google AI (generativelanguage.googleapis.com) directly,
-bypassing OpenRouter and its rate limits. Falls back to OpenRouter if not set.
+If GOOGLE_APPLICATION_CREDENTIALS is set, uses Vertex AI directly for Google models,
+bypassing OpenRouter and its rate limits, burning $300 Vertex credits instead.
+If GOOGLE_API_KEY is set (without credentials file), uses Google AI Studio directly.
+Falls back to OpenRouter for all other models or if no Google credentials are set.
 """
 
 from __future__ import annotations
@@ -146,8 +148,72 @@ class LLMClient:
         self._google_api_key = os.environ.get("GOOGLE_API_KEY", "")
 
     def _use_google_direct(self, model: str) -> bool:
-        """Return True if we should route this call directly to Google AI."""
-        return bool(self._google_api_key) and _is_google_model(model)
+        """Return True if we should route this call directly to Google (Vertex or AI Studio)."""
+        has_creds = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+        has_key = bool(self._google_api_key)
+        return (has_creds or has_key) and _is_google_model(model)
+
+    def _use_vertex(self) -> bool:
+        """Return True if Vertex service account credentials are available."""
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+        return bool(creds_path and os.path.exists(creds_path))
+
+    def _get_vertex_token(self) -> str:
+        """Get a short-lived OAuth2 access token from the service account JSON."""
+        import json
+        import time
+        import base64
+        import hashlib
+        import hmac
+        import struct
+
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+        with open(creds_path, "r") as f:
+            creds = json.load(f)
+
+        # Build JWT
+        now = int(time.time())
+        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "iss": creds["client_email"],
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token",
+            "exp": now + 3600,
+            "iat": now,
+        }).encode()).rstrip(b"=").decode()
+
+        import urllib.request
+        import urllib.parse
+
+        try:
+            from cryptography.hazmat.primitives import serialization, hashes
+            from cryptography.hazmat.primitives.asymmetric import padding
+            from cryptography.hazmat.backends import default_backend
+
+            private_key = serialization.load_pem_private_key(
+                creds["private_key"].encode(),
+                password=None,
+                backend=default_backend(),
+            )
+            signing_input = f"{header}.{payload}".encode()
+            signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+            sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+            jwt_token = f"{header}.{payload}.{sig_b64}"
+
+            data = urllib.parse.urlencode({
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jwt_token,
+            }).encode()
+            req = urllib.request.Request(
+                "https://oauth2.googleapis.com/token",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+                return result["access_token"]
+        except ImportError:
+            raise RuntimeError("cryptography package required for Vertex auth: pip install cryptography")
 
     def _get_client(self):
         if self._client is None:
@@ -163,12 +229,23 @@ class LLMClient:
         return self._client
 
     def _get_google_client(self):
-        """Return an OpenAI-compatible client pointed at Google AI Studio."""
+        """Return an OpenAI-compatible client pointed at Vertex AI or Google AI Studio."""
         from openai import OpenAI
-        return OpenAI(
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key=self._google_api_key,
-        )
+        if self._use_vertex():
+            # Vertex AI — service account auth, uses $300 credits, no daily rate wall
+            project_id = "gen-lang-client-0999726021"
+            location = "us-central1"
+            token = self._get_vertex_token()
+            return OpenAI(
+                base_url=f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/{location}/endpoints/openapi",
+                api_key=token,
+            )
+        else:
+            # Google AI Studio — API key auth, subject to daily limits
+            return OpenAI(
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                api_key=self._google_api_key,
+            )
 
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
         """Fetch cost from OpenRouter Generation API as fallback."""
