@@ -215,7 +215,14 @@ class LLMClient:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
             if role == "system":
-                system_instruction = content
+                # Handle both plain string and multipart list (Anthropic prompt caching format)
+                if isinstance(content, list):
+                    system_instruction = "\n\n".join(
+                        block.get("text", "") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                else:
+                    system_instruction = content
             elif role == "assistant":
                 # Handle tool calls in assistant messages
                 tool_calls = msg.get("tool_calls") or []
