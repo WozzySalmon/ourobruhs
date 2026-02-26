@@ -18,7 +18,7 @@ import threading
 from typing import Any, Dict, List
 
 try:
-    from playwright_stealth import Stealth
+    from undetected_playwright import Tarnished
     _HAS_STEALTH = True
 except ImportError:
     _HAS_STEALTH = False
@@ -161,8 +161,8 @@ def _ensure_browser(ctx: ToolContext):
     )
 
     if _HAS_STEALTH:
-        stealth = Stealth()
-        stealth.apply_stealth_sync(ctx.browser_state.page)
+        Tarnished.apply_stealth(ctx.browser_state.page.context)
+        # applied above
 
     ctx.browser_state.page.set_default_timeout(30000)
     return ctx.browser_state.page
