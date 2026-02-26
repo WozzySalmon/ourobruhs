@@ -168,14 +168,6 @@ class LLMClient:
             "reasoning": {"effort": effort, "exclude": True},
         }
 
-        # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
-            extra_body["provider"] = {
-                "order": ["Anthropic"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-            }
-
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
