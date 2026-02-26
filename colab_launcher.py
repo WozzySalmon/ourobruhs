@@ -241,6 +241,7 @@ from supervisor.queue import (
 from supervisor.workers import (
     init as workers_init, get_event_q, WORKERS, PENDING, RUNNING,
     spawn_workers, kill_workers, assign_tasks, ensure_workers_healthy,
+    handle_chat_direct, _get_chat_agent,
 )
 workers_init(
     repo_dir=REPO_DIR, drive_root=DRIVE_ROOT, max_workers=MAX_WORKERS,
