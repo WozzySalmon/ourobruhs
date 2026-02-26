@@ -188,6 +188,7 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
 # ---------------------------------------------------------------------------
 
 def auto_resume_after_restart() -> None:
+    return
     """If recent restart left open work, auto-resume without waiting for owner message.
 
     Checks: scratchpad content, recent restart events, pending_restart_verify.
