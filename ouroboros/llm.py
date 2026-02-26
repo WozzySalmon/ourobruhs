@@ -27,14 +27,25 @@ _GOOGLE_MODEL_MAP = {
     "google/gemini-3-pro-preview":   "publishers/google/models/gemini-3-pro-preview",
     "google/gemini-3-flash-preview": "publishers/google/models/gemini-3-flash-preview",
     "google/gemini-2.5-pro":         "gemini-2.5-pro",
-    "google/gemini-2.5-pro-preview": "gemini-2.5-pro-preview",
+    "google/gemini-2.5-pro-preview": "gemini-2.5-pro-preview-05-06",
     "google/gemini-2.5-flash":       "gemini-2.5-flash",
     "google/gemini-2.0-flash":       "gemini-2.0-flash",
 }
 
-# Vertex region — global works for preview models
-_VERTEX_LOCATION = "global"
-_VERTEX_PROJECT  = "gen-lang-client-0999726021"
+# Vertex region: 3.x models require "global", 2.x models need a real region
+_VERTEX_LOCATION_GLOBAL = "global"
+_VERTEX_LOCATION_REGIONAL = "us-central1"
+_VERTEX_PROJECT = "gen-lang-client-0999726021"
+
+
+def _vertex_location_for_model(native_model: str) -> str:
+    """Determine the correct Vertex region for a model.
+    Gemini 3.x (publishers/google/models/) → global
+    Gemini 2.x and others → us-central1
+    """
+    if "publishers/google/models/" in native_model:
+        return _VERTEX_LOCATION_GLOBAL
+    return _VERTEX_LOCATION_REGIONAL
 
 
 def _is_google_model(model: str) -> bool:
@@ -194,7 +205,7 @@ class LLMClient:
         self._client = None
         self._google_api_key = os.environ.get("GOOGLE_API_KEY", "")
         self._vertex_creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-        self._vertex_client = None
+        self._vertex_clients: Dict[str, Any] = {}
 
     def _use_vertex(self, model: str) -> bool:
         return bool(self._vertex_creds_path and os.path.exists(self._vertex_creds_path)) and _is_google_model(model)
@@ -202,21 +213,23 @@ class LLMClient:
     def _use_google_studio(self, model: str) -> bool:
         return bool(self._google_api_key) and _is_google_model(model) and not self._use_vertex(model)
 
-    def _get_vertex_client(self):
-        if self._vertex_client is None:
+    def _get_vertex_client(self, location: str = _VERTEX_LOCATION_GLOBAL):
+        """Get or create a Vertex AI client for the given location."""
+        if location not in self._vertex_clients:
             import google.oauth2.service_account
             from google import genai
             credentials = google.oauth2.service_account.Credentials.from_service_account_file(
                 self._vertex_creds_path,
                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
-            self._vertex_client = genai.Client(
+            self._vertex_clients[location] = genai.Client(
                 vertexai=True,
                 project=_VERTEX_PROJECT,
-                location=_VERTEX_LOCATION,
+                location=location,
                 credentials=credentials,
             )
-        return self._vertex_client
+            log.info("Initialized Vertex AI client (project=%s, location=%s)", _VERTEX_PROJECT, location)
+        return self._vertex_clients[location]
 
     def _get_client(self):
         if self._client is None:
@@ -287,19 +300,30 @@ class LLMClient:
         """Chat via Vertex AI using google-genai SDK. Uses $300 credits, no daily wall."""
         from google.genai import types as gtypes
 
-        client = self._get_vertex_client()
         native_model = _google_native_model_id(model)
-        log.debug(f"Vertex call: {model} → {native_model}")
+        client = self._get_vertex_client(location=_vertex_location_for_model(native_model))
+        log.debug(f"Vertex call: {model} → {native_model} (location={_vertex_location_for_model(native_model)})")
 
         # Build tool_call_id → function name mapping for tool results
         tc_id_to_name = _build_tool_call_id_to_name(messages)
 
         # Convert OpenAI-style messages to google-genai contents
+        # Key insight: Gemini 3.x thinking models attach thought_signatures to
+        # function calls. These MUST be replayed verbatim — reconstructing from
+        # OpenAI format loses them and causes 400 errors. We stash raw Gemini
+        # Content objects on message dicts as '_gemini_content' and use them
+        # when available.
         system_parts = []
         contents = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
+
+            # Fast path: use cached raw Gemini Content if available (preserves thought_signatures)
+            if "_gemini_content" in msg:
+                contents.append(msg["_gemini_content"])
+                continue
+
             if role == "system":
                 # Accumulate all system messages (don't overwrite — there may be many)
                 if isinstance(content, list):
@@ -336,9 +360,12 @@ class LLMClient:
                 # Resolve function name from tool_call_id (Gemini requires actual name, not just ID)
                 tool_call_id = msg.get("tool_call_id", "")
                 tool_name = tc_id_to_name.get(tool_call_id) or msg.get("name") or "unknown_tool"
-                contents.append(gtypes.Content(role="user", parts=[
+                gemini_content = gtypes.Content(role="user", parts=[
                     gtypes.Part(function_response=gtypes.FunctionResponse(name=tool_name, response=result))
-                ]))
+                ])
+                # Stash for future replay
+                msg["_gemini_content"] = gemini_content
+                contents.append(gemini_content)
             else:
                 # Handle multipart content (vision)
                 if isinstance(content, list):
@@ -417,6 +444,10 @@ class LLMClient:
         if not candidate.content or not candidate.content.parts:
             log.warning("Gemini candidate has no content/parts for %s", native_model)
             return msg_dict, {}
+
+        # Stash the raw Gemini Content object so we can replay it verbatim
+        # on the next round (preserves thought_signatures for thinking models)
+        msg_dict["_gemini_content"] = candidate.content
 
         for part in candidate.content.parts:
             if hasattr(part, "function_call") and part.function_call:
