@@ -288,6 +288,10 @@ class LLMClient:
             return self._chat_google_studio(messages, model, tools, effort, max_tokens, tool_choice)
         return self._chat_openrouter(messages, model, tools, effort, max_tokens, tool_choice)
 
+    # Per-model rate limiter: track last call time to avoid hammering Vertex
+    _last_vertex_call: float = 0.0
+    _VERTEX_MIN_INTERVAL: float = 1.5  # seconds between calls
+
     def _chat_vertex(
         self,
         messages: List[Dict[str, Any]],
@@ -299,6 +303,13 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Chat via Vertex AI using google-genai SDK. Uses $300 credits, no daily wall."""
         from google.genai import types as gtypes
+
+        # Rate limiting: ensure minimum interval between Vertex calls
+        now = time.time()
+        elapsed = now - self._last_vertex_call
+        if elapsed < self._VERTEX_MIN_INTERVAL:
+            time.sleep(self._VERTEX_MIN_INTERVAL - elapsed)
+        self._last_vertex_call = time.time()
 
         native_model = _google_native_model_id(model)
         client = self._get_vertex_client(location=_vertex_location_for_model(native_model))

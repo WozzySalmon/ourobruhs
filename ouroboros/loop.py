@@ -602,7 +602,7 @@ def run_llm_loop(
 
     llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
-    max_retries = 3
+    max_retries = 5  # enough headroom for Vertex 429s with backoff
     # Wire module-level registry ref so tool_discovery handlers work outside run_llm_loop too
     from ouroboros.tools import tool_discovery as _td
     _td.set_registry(tools)
@@ -814,6 +814,15 @@ def _emit_llm_usage_event(
         log.debug("Failed to put llm_usage event to queue", exc_info=True)
 
 
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Detect 429 / RESOURCE_EXHAUSTED / rate limit errors from any provider."""
+    err_str = str(e).lower()
+    return any(hint in err_str for hint in (
+        "429", "rate limit", "resource_exhausted", "resourceexhausted",
+        "quota exceeded", "too many requests",
+    ))
+
+
 def _call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -905,14 +914,23 @@ def _call_llm_with_retry(
 
         except Exception as e:
             last_error = e
+            is_rate_limit = _is_rate_limit_error(e)
             append_jsonl(drive_logs / "events.jsonl", {
                 "ts": utc_now_iso(), "type": "llm_api_error",
                 "task_id": task_id,
                 "round": round_idx, "attempt": attempt + 1,
                 "model": model, "error": repr(e),
+                "is_rate_limit": is_rate_limit,
             })
             if attempt < max_retries - 1:
-                time.sleep(min(2 ** attempt * 2, 30))
+                if is_rate_limit:
+                    # 429/RESOURCE_EXHAUSTED: wait longer (15s, 30s, 60s, ...)
+                    wait = min(15 * (2 ** attempt), 120)
+                    log.warning("Rate limited on %s, waiting %ds (attempt %d/%d)",
+                               model, wait, attempt + 1, max_retries)
+                else:
+                    wait = min(2 ** attempt * 2, 30)
+                time.sleep(wait)
 
     return None, 0.0
 
