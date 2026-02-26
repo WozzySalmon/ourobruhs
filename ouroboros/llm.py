@@ -11,6 +11,7 @@ Vertex uses $300 credits with no daily rate wall.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -100,6 +101,88 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
     except (requests.RequestException, ValueError, KeyError) as e:
         log.warning(f"Failed to fetch OpenRouter pricing: {e}")
         return {}
+
+
+def _build_tool_call_id_to_name(messages: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Build mapping from tool_call_id → function name from assistant messages.
+    
+    Gemini FunctionResponse requires the actual function name (e.g. 'repo_read'),
+    but OpenAI tool result messages only carry tool_call_id. This resolves them.
+    """
+    mapping = {}
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for tc in (msg.get("tool_calls") or []):
+                tc_id = tc.get("id", "")
+                fn_name = tc.get("function", {}).get("name", "")
+                if tc_id and fn_name:
+                    mapping[tc_id] = fn_name
+    return mapping
+
+
+def _clean_schema_for_gemini(schema: Any) -> Any:
+    """Recursively strip JSON Schema keywords that Gemini doesn't support.
+    
+    Gemini chokes on: additionalProperties, default, oneOf, anyOf, allOf,
+    $ref, $schema, pattern, format, minLength, maxLength, etc.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    UNSUPPORTED = {
+        "additionalProperties", "$schema", "$ref", "$defs",
+        "default", "oneOf", "anyOf", "allOf",
+        "if", "then", "else", "not", "patternProperties",
+        "minItems", "maxItems", "uniqueItems",
+        "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+        "multipleOf", "minLength", "maxLength", "pattern", "format",
+        "examples", "title",
+    }
+
+    cleaned = {}
+    for key, value in schema.items():
+        if key in UNSUPPORTED:
+            continue
+        if key == "type":
+            if isinstance(value, list):
+                non_null = [t for t in value if t != "null"]
+                cleaned["type"] = non_null[0] if non_null else "string"
+            elif value == "null":
+                cleaned["type"] = "string"
+            else:
+                cleaned["type"] = value
+        elif key == "properties" and isinstance(value, dict):
+            cleaned["properties"] = {
+                k: _clean_schema_for_gemini(v) for k, v in value.items()
+            }
+        elif key == "items" and isinstance(value, dict):
+            cleaned["items"] = _clean_schema_for_gemini(value)
+        elif key == "enum" and isinstance(value, list):
+            cleaned["enum"] = [v for v in value if v is not None]
+        else:
+            cleaned[key] = value
+
+    if "type" not in cleaned and "properties" in cleaned:
+        cleaned["type"] = "object"
+
+    return cleaned
+
+
+def _merge_consecutive_roles(contents: list) -> list:
+    """Merge consecutive Content objects with the same role.
+    
+    Gemini requires strictly alternating user/model roles.
+    Multiple tool results (each role='user') must be merged into one.
+    """
+    if not contents:
+        return contents
+    merged = [contents[0]]
+    for c in contents[1:]:
+        if merged[-1].role == c.role:
+            merged[-1].parts.extend(c.parts)
+        else:
+            merged.append(c)
+    return merged
 
 
 class LLMClient:
@@ -208,21 +291,27 @@ class LLMClient:
         native_model = _google_native_model_id(model)
         log.debug(f"Vertex call: {model} → {native_model}")
 
+        # Build tool_call_id → function name mapping for tool results
+        tc_id_to_name = _build_tool_call_id_to_name(messages)
+
         # Convert OpenAI-style messages to google-genai contents
-        system_instruction = None
+        system_parts = []
         contents = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
             if role == "system":
-                # Handle both plain string and multipart list (Anthropic prompt caching format)
+                # Accumulate all system messages (don't overwrite — there may be many)
                 if isinstance(content, list):
-                    system_instruction = "\n\n".join(
-                        block.get("text", "") for block in content
-                        if isinstance(block, dict) and block.get("type") == "text"
-                    )
-                else:
-                    system_instruction = content
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text.strip():
+                                system_parts.append(text)
+                        elif isinstance(block, str) and block.strip():
+                            system_parts.append(block)
+                elif isinstance(content, str) and content.strip():
+                    system_parts.append(content)
             elif role == "assistant":
                 # Handle tool calls in assistant messages
                 tool_calls = msg.get("tool_calls") or []
@@ -232,19 +321,22 @@ class LLMClient:
                         parts.append(gtypes.Part(text=content))
                     for tc in tool_calls:
                         fn = tc.get("function", {})
-                        import json as _json
-                        args = _json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else (fn.get("arguments") or {})
+                        args = json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else (fn.get("arguments") or {})
+                        parts.append(gtypes.Part(function_call=gtypes.FunctionCall(name=fn.get("name", ""), args=args)))
                         parts.append(gtypes.Part(function_call=gtypes.FunctionCall(name=fn.get("name", ""), args=args)))
                     contents.append(gtypes.Content(role="model", parts=parts))
                 else:
                     contents.append(gtypes.Content(role="model", parts=[gtypes.Part(text=content)]))
             elif role == "tool":
-                import json as _json
                 try:
-                    result = _json.loads(content) if isinstance(content, str) else content
+                    result = json.loads(content) if isinstance(content, str) else content
                 except Exception:
-                    result = {"result": content}
-                tool_name = msg.get("name") or "tool"
+                    result = {"result": str(content)[:10000]}
+                if not isinstance(result, dict):
+                    result = {"result": str(result)[:10000]}
+                # Resolve function name from tool_call_id (Gemini requires actual name, not just ID)
+                tool_call_id = msg.get("tool_call_id", "")
+                tool_name = tc_id_to_name.get(tool_call_id) or msg.get("name") or "unknown_tool"
                 contents.append(gtypes.Content(role="user", parts=[
                     gtypes.Part(function_response=gtypes.FunctionResponse(name=tool_name, response=result))
                 ]))
@@ -267,45 +359,74 @@ class LLMClient:
                 else:
                     contents.append(gtypes.Content(role="user", parts=[gtypes.Part(text=content)]))
 
-        # Build tool declarations
+        # Build tool declarations (clean schemas for Gemini compatibility)
         tool_list = None
         if tools:
-            import json as _json
             declarations = []
             for t in tools:
                 fn = t.get("function", {})
-                declarations.append(gtypes.FunctionDeclaration(
-                    name=fn.get("name", ""),
-                    description=fn.get("description", ""),
-                    parameters=fn.get("parameters"),
-                ))
-            tool_list = [gtypes.Tool(function_declarations=declarations)]
+                raw_params = fn.get("parameters")
+                cleaned_params = _clean_schema_for_gemini(raw_params) if raw_params else None
+                try:
+                    declarations.append(gtypes.FunctionDeclaration(
+                        name=fn.get("name", ""),
+                        description=(fn.get("description", "") or "")[:1024],
+                        parameters=cleaned_params,
+                    ))
+                except Exception as e:
+                    log.warning("Failed to convert tool '%s' for Gemini: %s", fn.get("name"), e)
+                    # Fallback: declare without parameters
+                    try:
+                        declarations.append(gtypes.FunctionDeclaration(
+                            name=fn.get("name", ""),
+                            description=(fn.get("description", "") or "")[:1024],
+                        ))
+                    except Exception:
+                        pass
+            if declarations:
+                tool_list = [gtypes.Tool(function_declarations=declarations)]
 
         config_kwargs: Dict[str, Any] = {"max_output_tokens": max_tokens}
+        system_instruction = "\n\n".join(system_parts) if system_parts else None
         if system_instruction:
             config_kwargs["system_instruction"] = system_instruction
         if tool_list:
             config_kwargs["tools"] = tool_list
 
-        resp = client.models.generate_content(
-            model=native_model,
-            contents=contents,
-            config=gtypes.GenerateContentConfig(**config_kwargs),
-        )
+        # Merge consecutive same-role messages (Gemini strict requirement)
+        contents = _merge_consecutive_roles(contents)
+
+        try:
+            resp = client.models.generate_content(
+                model=native_model,
+                contents=contents,
+                config=gtypes.GenerateContentConfig(**config_kwargs),
+            )
+        except Exception as e:
+            log.error("Vertex AI call failed for %s: %s", native_model, e)
+            raise
 
         # Convert response back to OpenAI-style message dict
         msg_dict: Dict[str, Any] = {"role": "assistant", "content": None}
         tool_calls_out = []
 
-        for part in (resp.candidates[0].content.parts if resp.candidates else []):
+        if not resp.candidates:
+            log.warning("Gemini returned no candidates for %s", native_model)
+            return msg_dict, {}
+
+        candidate = resp.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            log.warning("Gemini candidate has no content/parts for %s", native_model)
+            return msg_dict, {}
+
+        for part in candidate.content.parts:
             if hasattr(part, "function_call") and part.function_call:
-                import json as _json
                 tool_calls_out.append({
                     "id": f"call_{part.function_call.name}_{int(time.time()*1000)}",
                     "type": "function",
                     "function": {
                         "name": part.function_call.name,
-                        "arguments": _json.dumps(dict(part.function_call.args)),
+                        "arguments": json.dumps(dict(part.function_call.args) if part.function_call.args else {}),
                     }
                 })
             elif hasattr(part, "text") and part.text:
