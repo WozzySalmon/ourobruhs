@@ -428,7 +428,14 @@ def apply_message_token_soft_cap(
 
     # Prune log summaries from the dynamic text block in multipart system messages
     prunable = ["## Recent chat", "## Recent progress", "## Recent tools", "## Recent events", "## Supervisor"]
-    pruned = copy.deepcopy(messages)
+    # Shallow-copy messages list; deep-copy only system messages we might edit
+    # (avoid deepcopy on messages with _gemini_content — protobuf objects can't be deepcopied)
+    pruned = []
+    for m in messages:
+        if m.get("role") == "system" and isinstance(m.get("content"), list):
+            pruned.append(copy.deepcopy(m))
+        else:
+            pruned.append(m)
     for prefix in prunable:
         if estimated <= soft_cap_tokens:
             break

@@ -733,8 +733,11 @@ def run_llm_loop(
                 finish_reason = "⚠️ Loop detected: exact same tool calls executed 4 times in a row. Force stopping to save budget."
                 return finish_reason, accumulated_usage, llm_trace
 
-            # Process tool calls
-            messages.append({"role": "assistant", "content": content or "", "tool_calls": tool_calls})
+            # Process tool calls — append the original msg dict (preserves _gemini_content
+            # for Vertex AI thought_signature replay)
+            if not msg.get("content"):
+                msg["content"] = ""
+            messages.append(msg)
 
             if content and content.strip():
                 emit_progress(content.strip())
