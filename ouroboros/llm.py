@@ -323,7 +323,6 @@ class LLMClient:
                         fn = tc.get("function", {})
                         args = json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else (fn.get("arguments") or {})
                         parts.append(gtypes.Part(function_call=gtypes.FunctionCall(name=fn.get("name", ""), args=args)))
-                        parts.append(gtypes.Part(function_call=gtypes.FunctionCall(name=fn.get("name", ""), args=args)))
                     contents.append(gtypes.Content(role="model", parts=parts))
                 else:
                     contents.append(gtypes.Content(role="model", parts=[gtypes.Part(text=content)]))
