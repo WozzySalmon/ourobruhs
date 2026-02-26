@@ -1,8 +1,11 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter).
+The only module that communicates with the LLM API (OpenRouter or Google AI directly).
 Contract: chat(), default_model(), available_models(), add_usage().
+
+If GOOGLE_API_KEY is set, uses Google AI (generativelanguage.googleapis.com) directly,
+bypassing OpenRouter and its rate limits. Falls back to OpenRouter if not set.
 """
 
 from __future__ import annotations
@@ -15,6 +18,27 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3.0-flash"
+
+# Google AI model name mapping: OpenRouter-style → Google AI native
+_GOOGLE_MODEL_MAP = {
+    "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+    "google/gemini-3-pro-preview": "gemini-3-pro-preview",
+    "google/gemini-3-flash-preview": "gemini-3-flash-preview",
+    "google/gemini-2.5-pro": "gemini-2.5-pro",
+    "google/gemini-2.5-pro-preview": "gemini-2.5-pro-preview",
+    "google/gemini-2.5-flash": "gemini-2.5-flash",
+    "google/gemini-2.5-flash-preview": "gemini-2.5-flash-preview",
+    "google/gemini-2.0-flash": "gemini-2.0-flash",
+}
+
+
+def _is_google_model(model: str) -> bool:
+    return model.startswith("google/") or model.startswith("gemini-")
+
+
+def _google_native_model_id(model: str) -> str:
+    """Convert OpenRouter-style model ID to Google AI native ID."""
+    return _GOOGLE_MODEL_MAP.get(model, model.replace("google/", ""))
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -103,7 +127,13 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """
+    LLM API wrapper.
+
+    Routes to Google AI directly when GOOGLE_API_KEY is set and the model is a
+    Google model — bypassing OpenRouter rate limits and using $300 Vertex credits.
+    Falls back to OpenRouter for all other models.
+    """
 
     def __init__(
         self,
@@ -113,6 +143,11 @@ class LLMClient:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
+        self._google_api_key = os.environ.get("GOOGLE_API_KEY", "")
+
+    def _use_google_direct(self, model: str) -> bool:
+        """Return True if we should route this call directly to Google AI."""
+        return bool(self._google_api_key) and _is_google_model(model)
 
     def _get_client(self):
         if self._client is None:
@@ -126,6 +161,14 @@ class LLMClient:
                 },
             )
         return self._client
+
+    def _get_google_client(self):
+        """Return an OpenAI-compatible client pointed at Google AI Studio."""
+        from openai import OpenAI
+        return OpenAI(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=self._google_api_key,
+        )
 
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
         """Fetch cost from OpenRouter Generation API as fallback."""
@@ -161,11 +204,88 @@ class LLMClient:
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
-        client = self._get_client()
         effort = normalize_reasoning_effort(reasoning_effort)
 
+        if self._use_google_direct(model):
+            return self._chat_google(
+                messages=messages,
+                model=model,
+                tools=tools,
+                reasoning_effort=effort,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
+
+        return self._chat_openrouter(
+            messages=messages,
+            model=model,
+            tools=tools,
+            reasoning_effort=effort,
+            max_tokens=max_tokens,
+            tool_choice=tool_choice,
+        )
+
+    def _chat_google(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 16384,
+        tool_choice: str = "auto",
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Chat via Google AI Studio directly (no OpenRouter, no rate limit wall)."""
+        client = self._get_google_client()
+        native_model = _google_native_model_id(model)
+        log.debug(f"Google direct call: {model} → {native_model}")
+
+        kwargs: Dict[str, Any] = {
+            "model": native_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        resp = client.chat.completions.create(**kwargs)
+        resp_dict = resp.model_dump()
+        usage = resp_dict.get("usage") or {}
+        choices = resp_dict.get("choices") or [{}]
+        msg = (choices[0] if choices else {}).get("message") or {}
+
+        # Normalize token fields
+        if not usage.get("cached_tokens"):
+            prompt_details = usage.get("prompt_tokens_details") or {}
+            if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
+                usage["cached_tokens"] = int(prompt_details["cached_tokens"])
+
+        # Google AI doesn't include cost in usage — estimate from token counts
+        if not usage.get("cost"):
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            # Gemini 3.1 Pro pricing: $2/1M input, $12/1M output (approximate)
+            estimated_cost = (prompt_tokens / 1_000_000 * 2.0) + (completion_tokens / 1_000_000 * 12.0)
+            if estimated_cost > 0:
+                usage["cost"] = round(estimated_cost, 6)
+                usage["cost_estimated"] = True
+
+        return msg, usage
+
+    def _chat_openrouter(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 16384,
+        tool_choice: str = "auto",
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Chat via OpenRouter."""
+        client = self._get_client()
+
         extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
+            "reasoning": {"effort": reasoning_effort, "exclude": True},
         }
 
         kwargs: Dict[str, Any] = {
@@ -175,11 +295,9 @@ class LLMClient:
             "extra_body": extra_body,
         }
         if tools:
-            # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
+            tools_with_cache = [t for t in tools]
             if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
+                last_tool = {**tools_with_cache[-1]}
                 last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
                 tools_with_cache[-1] = last_tool
             kwargs["tools"] = tools_with_cache
@@ -191,15 +309,11 @@ class LLMClient:
         choices = resp_dict.get("choices") or [{}]
         msg = (choices[0] if choices else {}).get("message") or {}
 
-        # Extract cached_tokens from prompt_tokens_details if available
         if not usage.get("cached_tokens"):
             prompt_details = usage.get("prompt_tokens_details") or {}
             if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
                 usage["cached_tokens"] = int(prompt_details["cached_tokens"])
 
-        # Extract cache_write_tokens from prompt_tokens_details if available
-        # OpenRouter: "cache_write_tokens"
-        # Native Anthropic: "cache_creation_tokens" or "cache_creation_input_tokens"
         if not usage.get("cache_write_tokens"):
             prompt_details_for_write = usage.get("prompt_tokens_details") or {}
             if isinstance(prompt_details_for_write, dict):
@@ -209,7 +323,6 @@ class LLMClient:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
         if not usage.get("cost"):
             gen_id = resp_dict.get("id") or ""
             if gen_id:
@@ -242,7 +355,6 @@ class LLMClient:
         Returns:
             (text_response, usage_dict)
         """
-        # Build multipart content
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for img in images:
             if "url" in img:
