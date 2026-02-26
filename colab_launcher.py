@@ -241,7 +241,6 @@ from supervisor.queue import (
 from supervisor.workers import (
     init as workers_init, get_event_q, WORKERS, PENDING, RUNNING,
     spawn_workers, kill_workers, assign_tasks, ensure_workers_healthy,
-    handle_chat_direct, _get_chat_agent, auto_resume_after_restart,
 )
 workers_init(
     repo_dir=REPO_DIR, drive_root=DRIVE_ROOT, max_workers=MAX_WORKERS,
@@ -288,7 +287,6 @@ append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
 # ----------------------------
 # 6.1) Auto-resume after restart
 # ----------------------------
-auto_resume_after_restart()
 
 # ----------------------------
 # 6.2) Direct-mode watchdog

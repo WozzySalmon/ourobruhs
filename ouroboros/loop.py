@@ -618,6 +618,7 @@ def run_llm_loop(
     stateful_executor = _StatefulToolExecutor()
     # Dedup set for per-task owner messages from Drive mailbox
     _owner_msg_seen: set = set()
+    _tool_signature_history: list = []
     try:
         MAX_ROUNDS = max(1, int(os.environ.get("OUROBOROS_MAX_ROUNDS", "200")))
     except (ValueError, TypeError):
@@ -722,6 +723,15 @@ def run_llm_loop(
             # No tool calls — final response
             if not tool_calls:
                 return _handle_text_response(content, llm_trace, accumulated_usage)
+
+            # Check for duplicate action loop
+            import json, hashlib
+            sig_hash = hashlib.md5(json.dumps([{"name": tc.get("function", {}).get("name"), "args": tc.get("function", {}).get("arguments")} for tc in tool_calls], sort_keys=True).encode("utf-8")).hexdigest()
+            _tool_signature_history.append(sig_hash)
+            if len(_tool_signature_history) > 4: _tool_signature_history.pop(0)
+            if len(_tool_signature_history) == 4 and len(set(_tool_signature_history)) == 1:
+                finish_reason = "⚠️ Loop detected: exact same tool calls executed 4 times in a row. Force stopping to save budget."
+                return finish_reason, accumulated_usage, llm_trace
 
             # Process tool calls
             messages.append({"role": "assistant", "content": content or "", "tool_calls": tool_calls})
